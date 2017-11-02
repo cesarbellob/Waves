@@ -37,3 +37,21 @@ object MicroBlockInv{
     new MicroBlockInv(sender, totalBlockSig, prevBlockSig, ByteStr(signature))
   }
 }
+
+object LocalScoreChanged {
+  case class Reasoned(event: LocalScoreChanged, reason: Reason)
+  object Reasoned {
+    def apply(newLocalScore: History.BlockchainScore, reason: Reason): Reasoned = Reasoned(LocalScoreChanged(newLocalScore), reason)
+  }
+
+  sealed trait Reason
+  object Reason {
+    val All: Set[Reason] = Set(Checkpoint, BlockMined, SingleBlockApplied, ForkApplied, Rollback)
+
+    case object Checkpoint extends Reason
+    case object BlockMined extends Reason
+    case object SingleBlockApplied extends Reason
+    case object ForkApplied extends Reason
+    case object Rollback extends Reason
+  }
+}

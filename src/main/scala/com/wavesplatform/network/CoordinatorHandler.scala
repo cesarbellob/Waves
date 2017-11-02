@@ -43,9 +43,9 @@ class CoordinatorHandler(checkpointService: CheckpointService,
   private val processBlock = Coordinator.processSingleBlock(checkpointService, history, blockchainUpdater, time, stateReader, utxStorage, settings.blockchainSettings, featureProvider) _
   private val processMicroBlock = Coordinator.processMicroBlock(checkpointService, history, blockchainUpdater, utxStorage) _
 
-  private def scheduleMiningAndBroadcastScore(score: BigInt): Unit = {
+  private def scheduleMiningAndBroadcastScore(reason: LocalScoreChanged.Reason)(score: BigInt): Unit = {
     miner.scheduleMining()
-    allChannels.broadcast(LocalScoreChanged(score))
+    allChannels.broadcast(LocalScoreChanged.Reasoned(score, reason))
   }
 
   private def processAndBlacklistOnFailure[A](ctx: ChannelHandlerContext, start: => String, success: => String, errorPrefix: String,
@@ -67,7 +67,7 @@ class CoordinatorHandler(checkpointService: CheckpointService,
       "Attempting to process checkpoint",
       "Successfully processed checkpoint",
       s"Error processing checkpoint",
-      processCheckpoint(c).map(Some(_)), scheduleMiningAndBroadcastScore)
+      processCheckpoint(c).map(Some(_)), scheduleMiningAndBroadcastScore(LocalScoreChanged.Reason.Checkpoint))
 
     case ExtensionBlocks(blocks) =>
       blocks.foreach(BlockStats.received(_, BlockStats.Source.Ext, ctx))
@@ -76,7 +76,7 @@ class CoordinatorHandler(checkpointService: CheckpointService,
         s"Successfully appended extension ${formatBlocks(blocks)}",
         s"Error appending extension ${formatBlocks(blocks)}",
         processFork(blocks),
-        scheduleMiningAndBroadcastScore)
+        scheduleMiningAndBroadcastScore(LocalScoreChanged.Reason.ForkApplied))
 
     case b: Block => (Task {
       BlockStats.received(b, BlockStats.Source.Broadcast, ctx)
@@ -91,7 +91,7 @@ class CoordinatorHandler(checkpointService: CheckpointService,
         log.debug(s"Appended $b")
         if (b.transactionData.isEmpty)
           allChannels.broadcast(BlockForged(b), Some(ctx.channel()))
-        scheduleMiningAndBroadcastScore(newScore)
+        scheduleMiningAndBroadcastScore(LocalScoreChanged.Reason.SingleBlockApplied)(newScore)
       case Left(is: InvalidSignature) =>
         peerDatabase.blacklistAndClose(ctx.channel(), s"Could not append $b: $is")
       case Left(ve) =>
