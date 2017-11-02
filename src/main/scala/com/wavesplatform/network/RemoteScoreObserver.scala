@@ -6,6 +6,8 @@ import java.util.concurrent.atomic.AtomicReference
 import com.wavesplatform.state2.ByteStr
 import io.netty.channel.ChannelHandler.Sharable
 import io.netty.channel._
+import monix.eval.Task
+import monix.execution.Scheduler
 import scorex.transaction.History
 import scorex.utils.ScorexLogging
 
@@ -18,12 +20,14 @@ import scala.util.{Failure, Success}
 class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteStr], initialLocalScore: BigInt)
   extends ChannelDuplexHandler with ScorexLogging {
 
+  private val scheduler = Scheduler.singleThread("remote-score-observer")
+
   private type ScorePair = (Channel, BigInt)
 
   private val scores = new ConcurrentHashMap[Channel, BigInt]
 
   @volatile private var localScore = initialLocalScore
-  private val currentRequest = new AtomicReference[Option[ScorePair]](None)
+  private var currentRequest = Option.empty[ScorePair]
 
   private def channelWithHighestScore: Option[ScorePair] = {
     Option(scores.reduceEntries(1000, (c1, c2) => if (c1.getValue > c2.getValue) c1 else c2))
@@ -37,18 +41,49 @@ class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteS
         log.debug(s"${id(ctx)} Closed, removing score $removedScore")
       }
 
-      trySwitchToBestFrom(ctx, "Switching to second best channel, because the best one was closed")
+      Task {
+        if (currentRequest.exists(_._1 == ctx.channel())) {
+          log.debug("Switching to second best channel, because the best one was closed")
+          currentRequest = channelWithHighestScore
+          currentRequest.foreach {
+            case (c, s) if s > localScore => requestExtension(c)
+            case _ => currentRequest = None
+          }
+        }
+      }.runAsync(scheduler)
     }
   }
 
   override def write(ctx: ChannelHandlerContext, msg: AnyRef, promise: ChannelPromise): Unit = msg match {
     case LocalScoreChanged(newLocalScore, reason) =>
       localScore = newLocalScore
-      if (reason == LocalScoreChanged.Reason.ForkApplied) trySwitchToBestFrom(ctx, "Fork was processed")
-      else if (reason == LocalScoreChanged.Reason.Rollback) {
-        currentRequest.set(None)
-        log.info("Rollback happens, stop receiving a current extension and request a new one")
-        trySwitchToBestIf(ctx, "Rollback")(_.isEmpty)
+      if (reason == LocalScoreChanged.Reason.ForkApplied) {
+        Task {
+          if (currentRequest.exists(_._1 == ctx.channel())) {
+            log.debug("Fork applied")
+            val candidate = channelWithHighestScore
+            if (candidate.exists(_._1 == ctx.channel())) {
+              currentRequest = None
+            } else {
+              currentRequest = candidate
+              currentRequest.foreach {
+                case (c, s) if s > localScore => requestExtension(c)
+                case _ => currentRequest = None
+              }
+            }
+          }
+        }.runAsync(scheduler)
+      } else if (reason == LocalScoreChanged.Reason.Rollback) {
+        Task {
+          if (currentRequest.exists(_._1 == ctx.channel())) {
+            log.debug("Rollback")
+            currentRequest = channelWithHighestScore
+            currentRequest.foreach {
+              case (c, s) if s > localScore => requestExtension(c)
+              case _ => currentRequest = None
+            }
+          }
+        }.runAsync(scheduler)
       }
       super.write(ctx, msg, promise)
 
@@ -66,62 +101,86 @@ class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteS
       if (diff != 0) {
         scheduleExpiration(ctx, newScore)
         log.trace(s"${id(ctx)} New score: $newScore (diff: $diff)")
-        trySwitchToBestIf(ctx, "A new score")(_.isEmpty)
+        Task {
+          if (currentRequest.isEmpty) {
+            log.debug("New score")
+            currentRequest = channelWithHighestScore
+            currentRequest.foreach {
+              case (c, s) if s > localScore => requestExtension(c)
+              case _ => currentRequest = None
+            }
+          }
+        }.runAsync(scheduler)
       }
 
     case ExtensionBlocks(blocks) =>
-      val isExpectedResponse = currentRequest.get().exists(_._1 == ctx.channel())
-      if (!isExpectedResponse) {
-        log.debug(s"${id(ctx)} Received blocks ${formatBlocks(blocks)} from non-pinned channel (could be from expired channel)")
-      } else if (blocks.isEmpty) {
-        log.debug(s"${id(ctx)} Blockchain is up to date with the remote node")
-        trySwitchToBestFrom(ctx, "Blockchain is up to date with requested extension")
-      } else {
-        log.debug(s"${id(ctx)} Received extension blocks ${formatBlocks(blocks)}")
-        super.channelRead(ctx, msg)
-      }
+      Task {
+        val isExpectedResponse = currentRequest.exists(_._1 == ctx.channel())
+        if (!isExpectedResponse) {
+          log.debug(s"${id(ctx)} Received blocks ${formatBlocks(blocks)} from non-pinned channel (could be from expired channel)")
+        } else if (blocks.isEmpty) {
+          log.debug(s"${id(ctx)} Blockchain is up to date with the remote node")
+          currentRequest = channelWithHighestScore
+          currentRequest.foreach {
+            case (c, s) if s > localScore => requestExtension(c)
+            case _ => currentRequest = None
+          }
+        } else {
+          log.debug(s"${id(ctx)} Received extension blocks ${formatBlocks(blocks)}")
+          super.channelRead(ctx, msg)
+        }
+      }.runAsync(scheduler)
 
     case _ => super.channelRead(ctx, msg)
   }
 
   private def scheduleExpiration(ctx: ChannelHandlerContext, score: BigInt): Unit = {
-    ctx.executor().schedule(scoreTtl) {
-      if (scores.remove(ctx.channel(), score)) trySwitchToBestFrom(ctx, "Score expired")
-    }
-  }
-
-  private def trySwitchToBestFrom(initiatorCtx: ChannelHandlerContext, reason: String): Unit = {
-    trySwitchToBestIf(initiatorCtx, reason)(_.exists(_._1 == initiatorCtx.channel()))
-  }
-
-  // what if best == prev?
-  private def trySwitchToBestIf(initiatorCtx: ChannelHandlerContext, reason: String)
-                               (shouldTry: Option[ScorePair] => Boolean): Unit = {
-    switchChannel { (prev: Option[ScorePair], best: Option[ScorePair]) =>
-      best.flatMap { case (_, bestRemoteScore) =>
-        if (shouldTry(prev)) {
-          if (bestRemoteScore > localScore) best else None
-        } else prev
+    Task {
+      if (scores.remove(ctx.channel(), score)) {
+        log.debug("Score expired")
+        if (currentRequest.exists(_._1 == ctx.channel())) {
+          currentRequest = channelWithHighestScore
+          currentRequest.foreach {
+            case (c, s) if s > localScore => requestExtension(c)
+            case _ => currentRequest = None
+          }
+        }
       }
-    }.foreach { case ((bestRemoteChannel, bestRemoteScore)) =>
-      log.debug(
-        s"${id(initiatorCtx)} A new pinned channel ${id(bestRemoteChannel)} has score $bestRemoteScore " +
-          s"(diff with local: ${bestRemoteScore - localScore}): requesting an extension. Reason: $reason"
-      )
-      requestExtension(bestRemoteChannel)
-    }
+    }.delayExecution(scoreTtl).runAsync(scheduler)
   }
 
-  private def switchChannel(f: (Option[ScorePair], Option[ScorePair]) => Option[ScorePair]): Option[ScorePair] = {
-    val newValue = channelWithHighestScore
-    var curr, next = Option.empty[ScorePair]
+//  private def trySwitchToBestFrom(initiatorCtx: ChannelHandlerContext, reason: String): Unit = {
+//    trySwitchToBestIf(initiatorCtx, reason)(_.exists(_._1 == initiatorCtx.channel()))
+//  }
+//
+//  // what if best == prev?
+//  private def trySwitchToBestIf(initiatorCtx: ChannelHandlerContext, reason: String)
+//                               (shouldTry: Option[ScorePair] => Boolean): Unit = {
+//    switchChannel { (prev: Option[ScorePair], best: Option[ScorePair]) =>
+//      best.flatMap { case (_, bestRemoteScore) =>
+//        if (shouldTry(prev)) {
+//          if (bestRemoteScore > localScore) best else None
+//        } else prev
+//      }
+//    }.foreach { case (prev, (bestRemoteChannel, bestRemoteScore)) =>
+//      log.debug(
+//        s"${id(initiatorCtx)} A new pinned channel ${id(bestRemoteChannel)} has score $bestRemoteScore " +
+//          s"(diff with local: ${bestRemoteScore - localScore}), prev = $prev: requesting an extension. Reason: $reason"
+//      )
+//      requestExtension(bestRemoteChannel)
+//    }
+//  }
 
-    do {
-      curr = currentRequest.get()
-      next = f(curr, newValue)
-    } while (!currentRequest.compareAndSet(curr, next))
-
-    if (next == curr) None else next
-  }
+//  private def switchChannel(f: (Option[ScorePair], Option[ScorePair]) => Option[ScorePair]) = {
+//    val newValue = channelWithHighestScore
+//    var curr, next = Option.empty[ScorePair]
+//
+//    do {
+//      curr = currentRequest.get()
+//      next = f(curr, newValue)
+//    } while (!currentRequest.compareAndSet(curr, next))
+//
+//    if (next == curr) None else next.map { x => (curr, x) }
+//  }
 
 }
