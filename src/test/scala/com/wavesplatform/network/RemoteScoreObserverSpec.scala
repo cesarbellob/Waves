@@ -46,7 +46,7 @@ class RemoteScoreObserverSpec extends FreeSpec
       channel1.flushInbound()
 
       currentLastSignatures :+= ByteStr("block#2".getBytes)
-      channel1.writeOutbound(LocalScoreChanged.Reasoned(channel1Score, LocalScoreChanged.Reason.ForkApplied))
+      channel1.writeOutbound(LocalScoreChanged(channel1Score, LocalScoreChanged.Reason.ForkApplied))
 
       val channel2 = new EmbeddedChannel(scoreObserver)
       channel2.writeInbound(BigInt(3))
@@ -115,6 +115,26 @@ class RemoteScoreObserverSpec extends FreeSpec
 //        }
 //      }
     }
+
+    "immediately on rollback" in {
+      val scoreObserver = new RemoteScoreObserver(1.minute, lastSignatures, 1)
+
+      val channel1 = new EmbeddedChannel(scoreObserver)
+      channel1.writeInbound(BigInt(2))
+      channel1.flushInbound()
+
+      val channel2 = new EmbeddedChannel(scoreObserver)
+      channel2.writeInbound(BigInt(3))
+      channel2.flushInbound()
+
+      channel1.writeOutbound(LocalScoreChanged(BigInt(1), LocalScoreChanged.Reason.Rollback))
+
+      val expected = LoadBlockchainExtension(lastSignatures)
+      eventually {
+        val actual = channel2.readOutbound[LoadBlockchainExtension]()
+        actual shouldBe expected
+      }
+    }
   }
 
   "should not request a new extension if a previous one is not downloaded yet" - {
@@ -162,15 +182,11 @@ class RemoteScoreObserverSpec extends FreeSpec
       }
     }
 
-    "if the local score is changed" - {
-      (LocalScoreChanged.Reason.All - LocalScoreChanged.Reason.ForkApplied).foreach { reason =>
-        s"because of $reason" - {
-          "new local score is still worse" in test(3, LocalScoreChanged.Reasoned(2, reason))
-          "new local score is better" in test(2, LocalScoreChanged.Reasoned(3, reason))
-        }
-      }
+    "if the local score is changed for Other reason" - {
+      "new local score is still worse" in test(3, 2)
+      "new local score is better" in test(2, 3)
 
-      def test(remoteScore: BigInt, newLocalScore: LocalScoreChanged.Reasoned): Unit = {
+      def test(remoteScore: BigInt, newLocalScore: BigInt): Unit = {
         var currentLastSignatures = lastSignatures
 
         val channel = new EmbeddedChannel(new RemoteScoreObserver(1.minute, currentLastSignatures, 1))
@@ -183,7 +199,7 @@ class RemoteScoreObserverSpec extends FreeSpec
         }
 
         currentLastSignatures :+= ByteStr("block#2".getBytes)
-        channel.writeOutbound(newLocalScore)
+        channel.writeOutbound(LocalScoreChanged(newLocalScore, LocalScoreChanged.Reason.Other))
 
         intercept[TestFailedDueToTimeoutException] {
           eventually {

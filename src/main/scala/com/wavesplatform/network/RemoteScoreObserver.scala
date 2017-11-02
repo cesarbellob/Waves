@@ -42,10 +42,15 @@ class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteS
   }
 
   override def write(ctx: ChannelHandlerContext, msg: AnyRef, promise: ChannelPromise): Unit = msg match {
-    case LocalScoreChanged.Reasoned(event, reason) =>
-      localScore = event.newLocalScore
+    case LocalScoreChanged(newLocalScore, reason) =>
+      localScore = newLocalScore
       if (reason == LocalScoreChanged.Reason.ForkApplied) trySwitchToBestFrom(ctx, "Fork was processed")
-      super.write(ctx, event, promise)
+      else if (reason == LocalScoreChanged.Reason.Rollback) {
+        currentRequest.set(None)
+        log.info("Rollback happens, stop receiving a current extension and request a new one")
+        trySwitchToBestIf(ctx, "Rollback")(_.isEmpty)
+      }
+      super.write(ctx, msg, promise)
 
     case _ => super.write(ctx, msg, promise)
   }
