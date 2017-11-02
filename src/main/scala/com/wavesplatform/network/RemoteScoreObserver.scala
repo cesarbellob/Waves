@@ -94,6 +94,7 @@ class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteS
     trySwitchToBestIf(initiatorCtx, reason)(_.exists(_._1 == initiatorCtx.channel()))
   }
 
+  // what if best == prev?
   private def trySwitchToBestIf(initiatorCtx: ChannelHandlerContext, reason: String)
                                (shouldTry: Option[ScorePair] => Boolean): Unit = {
     switchChannel { (prev: Option[ScorePair], best: Option[ScorePair]) =>
